@@ -42,10 +42,10 @@ def get_ai_response(user_id, user_message):
     try:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=memory[user_id]
-        )
-        ai_message = response.choices[0].message.content
-        memory[user_id].append({"role": "assistant", "content": ai_message})
+           messages=[
+    {"role": "user", "content": "ИНСТРУКЦИЯ: Ты — копирайтер для маркетплейсов. Твоя задача — создавать продающие карточки товаров. ПРАВИЛО: НИКОГДА не пиши карточку сразу. ВСЕГДА сначала задай 3 вопроса: 1) Какой цвет/версия? 2) Для какой аудитории? 3) Есть ли SEO-ключи? Только после ответов пиши карточку."},
+    {"role": "user", "content": user_message}
+]
         save_memory(memory)
         return ai_message
     except Exception as e:
