@@ -1,35 +1,64 @@
 import os
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters
-from groq import Groq
 import json
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from groq import Groq
+import psycopg
+from psycopg.rows import dict_row
+from dotenv import load_dotenv
 
-# Токен бота от BotFather (берётся из переменных окружения)
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Загрузка переменных окружения
+load_dotenv()
 
-# Ключ Groq API (берётся из переменных окружения)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Инициализация Groq
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ====== Работа с файлом памяти ======
-MEMORY_FILE = "memory.json"
+# Память для хранения истории сообщений
+memory = {}
 
 def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    """Загрузка памяти из базы данных"""
+    try:
+        conn = psycopg.connect(os.getenv("DATABASE_URL"), row_factory=dict_row)
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS user_memory (user_id BIGINT PRIMARY KEY, history JSONB)")
+        cursor.execute("SELECT user_id, history FROM user_memory")
+        rows = cursor.fetchall()
+        for row in rows:
+            memory[row['user_id']] = row['history']
+        cursor.close()
+        conn.close()
+        logger.info("Память загружена из базы данных")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки памяти: {e}")
 
-def save_memory(memory):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory, f, ensure_ascii=False, indent=2)
-
-# Загружаем память при старте
-memory = load_memory()
+def save_memory(memory_dict):
+    """Сохранение памяти в базу данных"""
+    try:
+        conn = psycopg.connect(os.getenv("DATABASE_URL"), row_factory=dict_row)
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS user_memory (user_id BIGINT PRIMARY KEY, history JSONB)")
+        for user_id, history in memory_dict.items():
+            cursor.execute(
+                "INSERT INTO user_memory (user_id, history) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET history = %s",
+                (user_id, json.dumps(history), json.dumps(history))
+            )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка сохранения памяти: {e}")
 
 def get_ai_response(user_id, user_message):
+    """Получение ответа от AI с системным промптом"""
     if user_id not in memory:
         memory[user_id] = []
     
@@ -40,59 +69,83 @@ def get_ai_response(user_id, user_message):
         memory[user_id] = memory[user_id][-10:]
     
     try:
+        # Системный промпт - инструкция для бота
+        system_prompt = "Ты — копирайтер для маркетплейсов. НИКОГДА не пиши карточку сразу. ВСЕГДА сначала задай 3 вопроса: 1) Какой цвет/версия? 2) Для какой аудитории? 3) Есть ли SEO-ключи? Только после ответов пиши карточку."
+        
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=memory[user_id]
+            messages=[
+                {"role": "system", "content": system_prompt},
+                *memory[user_id]
+            ]
         )
+        
         ai_message = response.choices[0].message.content
         memory[user_id].append({"role": "assistant", "content": ai_message})
         save_memory(memory)
         return ai_message
     except Exception as e:
+        logger.error(f"Ошибка при получении ответа от AI: {e}")
         return f"Ошибка: {str(e)}"
 
 # ====== Обработчики команд ======
-def start(update, context):
-    update.message.reply_text("Привет! Я AI-бот. Напиши мне что-нибудь!")
 
-def clear(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    await update.message.reply_text("Привет! Я AI-бот для создания карточек товаров. Напиши мне что-нибудь!")
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /clear - очистка памяти"""
     user_id = update.message.from_user.id
     if user_id in memory:
         del memory[user_id]
         save_memory(memory)
-    update.message.reply_text("Память очищена!")
+    await update.message.reply_text("Память очищена!")
 
-def newchat(update, context):
+async def newchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /newchat - новый чат"""
     user_id = update.message.from_user.id
-    memory[user_id] = []
-    save_memory(memory)
-    update.message.reply_text("Новый чат начат!")
+    if user_id in memory:
+        del memory[user_id]
+        save_memory(memory)
+    await update.message.reply_text("Начинаем новый диалог! Чем могу помочь?")
 
-def stats(update, context):
-    user_id = update.message.from_user.id
-    count = len(memory.get(user_id, []))
-    update.message.reply_text(f"Сообщений в памяти: {count}")
-
-def handle_message(update, context):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик обычных сообщений"""
     user_id = update.message.from_user.id
     user_message = update.message.text
-    response = get_ai_response(user_id, user_message)
-    update.message.reply_text(response)
+    
+    # Показываем, что бот печатает
+    await update.message.chat.send_action(action="typing")
+    
+    # Получаем ответ от AI
+    ai_response = get_ai_response(user_id, user_message)
+    
+    # Отправляем ответ
+    await update.message.reply_text(ai_response)
 
-# ====== Запуск бота ======
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Update {update} caused error {context.error}")
+
 def main():
-    updater = Updater(TOKEN)
-    dp = updater.dispatcher
+    """Запуск бота"""
+    # Загрузка памяти
+    load_memory()
     
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("clear", clear))
-    dp.add_handler(CommandHandler("newchat", newchat))
-    dp.add_handler(CommandHandler("stats", stats))
-    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Создание приложения
+    application = Application.builder().token(os.getenv("TELEGRAM_TOKEN")).build()
     
-    print("🤖 Бот запущен!")
-    updater.start_polling()
-    updater.idle()
+    # Регистрация обработчиков
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("newchat", newchat))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
+    
+    # Запуск бота
+    logger.info("Бот запускается...")
+    application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
