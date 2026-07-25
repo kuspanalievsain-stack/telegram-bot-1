@@ -1,19 +1,21 @@
 import os
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters
-from groq import Groq
 import json
+import requests
+import base64
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from groq import Groq
 
-# Токен бота от BotFather (берётся из переменных окружения)
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Инициализация
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Ключ Groq API (берётся из переменных окружения)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not TOKEN or not GROQ_API_KEY:
+    raise ValueError("Не установлены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-# Инициализация Groq
 client = Groq(api_key=GROQ_API_KEY)
 
-# ====== Работа с файлом памяти ======
+# Файл для хранения истории
 MEMORY_FILE = "memory.json"
 
 def load_memory():
@@ -26,73 +28,180 @@ def save_memory(memory):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
 
-# Загружаем память при старте
-memory = load_memory()
+# Загрузка памяти при старте
+user_memory = load_memory()
 
-def get_ai_response(user_id, user_message):
-    if user_id not in memory:
-        memory[user_id] = []
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я ИИ-бот с памятью.\n\n"
+        "📝 Просто пиши мне — я запомню наш разговор.\n"
+        "🎨 /gen <описание> — сгенерирую картинку\n"
+        " Пришли фото — опишу что на нём\n"
+        "🗑 /clear — очистить память\n"
+        "❓ /help — помощь"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 **Мои возможности:**\n\n"
+        " **Обычный чат** — пиши что угодно, я запомню контекст\n"
+        "🎨 **/gen <текст>** — сгенерирую изображение по описанию\n"
+        "📷 **Отправь фото** — опишу что на нём изображено\n"
+        "🗑 **/clear** — очистить историю разговора\n\n"
+        "💡 Примеры:\n"
+        "• /gen кот в космосе\n"
+        "• /gen закат над морем\n"
+        "• Просто пришли фото!",
+        parse_mode="Markdown"
+    )
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id in user_memory:
+        del user_memory[user_id]
+        save_memory(user_memory)
+        await update.message.reply_text("🗑 Память очищена!")
+    else:
+        await update.message.reply_text("Память уже пуста.")
+
+async def generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерация изображений через Pollinations.ai"""
+    user_id = str(update.effective_user.id)
     
-    memory[user_id].append({"role": "user", "content": user_message})
+    # Получаем текст после команды /gen
+    prompt = " ".join(context.args) if context.args else None
     
-    # Ограничиваем историю последними 10 сообщениями
-    if len(memory[user_id]) > 10:
-        memory[user_id] = memory[user_id][-10:]
+    if not prompt:
+        await update.message.reply_text("❗ Укажи описание: /gen <что нарисовать>")
+        return
+    
+    await update.message.reply_text(f"🎨 Генерирую: {prompt}...")
     
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=memory[user_id]
-        )
-        ai_message = response.choices[0].message.content
-        memory[user_id].append({"role": "assistant", "content": ai_message})
-        save_memory(memory)
-        return ai_message
+        # Формируем URL для Pollinations.ai
+        encoded_prompt = requests.utils.quote(prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        
+        # Отправляем изображение
+        await update.message.reply_photo(photo=image_url, caption=f"✅ Готово!\nЗапрос: {prompt}")
+        
     except Exception as e:
-        return f"Ошибка: {str(e)}"
+        await update.message.reply_text(f"❌ Ошибка генерации: {str(e)}")
 
-# ====== Обработчики команд ======
-def start(update, context):
-    update.message.reply_text("Привет! Я AI-бот. Напиши мне что-нибудь!")
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Анализ фото через Groq Vision API"""
+    user_id = str(update.effective_user.id)
+    
+    await update.message.reply_text("👁 Анализирую изображение...")
+    
+    try:
+        # Получаем file_id самого большого фото
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        
+        # Скачиваем фото во временный файл
+        photo_path = f"temp_photo_{user_id}.jpg"
+        await file.download_to_drive(photo_path)
+        
+        # Читаем файл и конвертируем в base64
+        with open(photo_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+        
+        # Отправляем в Groq Vision API
+        response = client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Опиши подробно что изображено на этом фото. На русском языке."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000
+        )
+        
+        description = response.choices[0].message.content
+        await update.message.reply_text(f" **Описание:**\n\n{description}", parse_mode="Markdown")
+        
+        # Удаляем временный файл
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка анализа фото: {str(e)}")
+        # Очищаем временный файл при ошибке
+        photo_path = f"temp_photo_{user_id}.jpg"
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
 
-def clear(update, context):
-    user_id = update.message.from_user.id
-    if user_id in memory:
-        del memory[user_id]
-        save_memory(memory)
-    update.message.reply_text("Память очищена!")
-
-def newchat(update, context):
-    user_id = update.message.from_user.id
-    memory[user_id] = []
-    save_memory(memory)
-    update.message.reply_text("Новый чат начат!")
-
-def stats(update, context):
-    user_id = update.message.from_user.id
-    count = len(memory.get(user_id, []))
-    update.message.reply_text(f"Сообщений в памяти: {count}")
-
-def handle_message(update, context):
-    user_id = update.message.from_user.id
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обычный текстовый чат с памятью"""
+    user_id = str(update.effective_user.id)
     user_message = update.message.text
-    response = get_ai_response(user_id, user_message)
-    update.message.reply_text(response)
+    
+    # Инициализируем память для нового пользователя
+    if user_id not in user_memory:
+        user_memory[user_id] = []
+    
+    # Добавляем сообщение пользователя в историю
+    user_memory[user_id].append({"role": "user", "content": user_message})
+    
+    # Ограничиваем историю последними 20 сообщениями
+    if len(user_memory[user_id]) > 20:
+        user_memory[user_id] = user_memory[user_id][-20:]
+    
+    try:
+        # Отправляем запрос в Groq с историей
+        response = client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=user_memory[user_id],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        bot_reply = response.choices[0].message.content
+        
+        # Добавляем ответ бота в историю
+        user_memory[user_id].append({"role": "assistant", "content": bot_reply})
+        
+        # Сохраняем память
+        save_memory(user_memory)
+        
+        # Отправляем ответ
+        await update.message.reply_text(bot_reply)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-# ====== Запуск бота ======
 def main():
-    updater = Updater(TOKEN)
-    dp = updater.dispatcher
+    # Создаём приложение (новый API для версии 21.x)
+    application = Application.builder().token(TOKEN).build()
     
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("clear", clear))
-    dp.add_handler(CommandHandler("newchat", newchat))
-    dp.add_handler(CommandHandler("stats", stats))
-    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("gen", generate_image))
     
-    print("🤖 Бот запущен!")
-    updater.start_polling()
-    updater.idle()
+    # Обработчик фото
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    # Обработчик текстовых сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print(" Бот запущен!")
+    # Запускаем бота (новый API)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
